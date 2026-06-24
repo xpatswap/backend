@@ -1,0 +1,780 @@
+// ============================================================
+// XPATSWAP — Prisma Schema
+// Covers: auth/OTP, vendor KYC, listings, brands/categories,
+// communities, group + private chat, calls log, ranking/likes
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------
+// ENUMS
+// ---------------------------------------------------------------
+
+enum AccountType {
+  BUYER
+  SELL_ONLY
+  SELL_SWAP
+}
+
+enum VendorStatus {
+  NONE
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum ProductCondition {
+  BRAND_NEW
+  UK_USED
+  NIGERIAN_USED
+  REPAIRED     // device worked on / repaired by the seller or a technician, original device
+  REFURBISHED  // non-original device — parts/unit replaced, not the original hardware
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VOICE
+  LISTING_SHARE
+  LOCATION
+  CALL_LOG
+  SYSTEM
+  STOLEN_DEVICE_ALERT
+}
+
+enum ThreadSourceType {
+  GROUP_REPLY
+  LISTING_CHAT
+  SUPPORT
+}
+
+enum CallType {
+  VOICE
+  VIDEO
+}
+
+enum CallStatus {
+  RINGING
+  CONNECTED
+  MISSED
+  ENDED
+  DECLINED
+}
+
+enum NotificationType {
+  NEW_MESSAGE
+  VENDOR_APPROVED
+  VENDOR_REJECTED
+  LISTING_LIKED
+  NEW_FOLLOWER
+  CALL_MISSED
+  GROUP_MENTION
+  DEVICE_STOLEN_LOCATION
+  STOLEN_IMEI_SEARCHED
+  SYSTEM
+}
+
+// ---------------------------------------------------------------
+// USERS & AUTH
+// ---------------------------------------------------------------
+
+model User {
+  id              String       @id @default(uuid())
+  fullName        String
+  email           String       @unique
+  phone           String       @unique
+  passwordHash    String
+  dob             DateTime
+  address         String
+  accountType     AccountType  @default(BUYER)
+  emailVerified   Boolean      @default(false)
+  avatarUrl       String?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+  lastSeenAt      DateTime?
+  isActive        Boolean      @default(true)
+
+  // ---- Referral & wallet ----
+  referralCode    String       @unique // shown to the user, shared to invite others
+  referredById    String?      // the user whose code was used at signup, if any
+  referredBy      User?        @relation("Referrals", fields: [referredById], references: [id], onDelete: SetNull)
+  referrals       User[]       @relation("Referrals") // people who signed up using THIS user's code
+  walletBalance   Int          @default(0) // spendable balance, in whole Naira (NOT kobo)
+  escrowBalance   Int          @default(0) // funds held in escrow as a BUYER on open orders — not spendable, shown separately
+  walletTransactions WalletTransaction[]
+  devices         Device[]
+  deviceTransfersFrom DeviceOwnershipTransfer[] @relation("DeviceTransferFrom")
+  deviceTransfersTo   DeviceOwnershipTransfer[] @relation("DeviceTransferTo")
+  imeiSearches    DeviceImeiSearchLog[]
+  pushSubscriptions PushSubscription[]
+
+  // Relations
+  vendorProfile   VendorProfile?
+  listings        Listing[]
+  sentMessages    Message[]        @relation("MessageSender")
+  threadsAsUserA  Thread[]         @relation("ThreadUserA")
+  threadsAsUserB  Thread[]         @relation("ThreadUserB")
+  communityMemberships CommunityMember[]
+  likes           Like[]
+  swapsAsBuyer    SwapRequest[]    @relation("SwapBuyer")
+  swapsAsSeller   SwapRequest[]    @relation("SwapSeller")
+  ordersAsBuyer   Order[]          @relation("OrderBuyer")
+  ordersAsSeller  Order[]          @relation("OrderSeller")
+  deposits        PaymentDeposit[]
+  payouts         Payout[]
+  bankAccounts    BankAccount[]
+  callsInitiated  Call[]           @relation("CallCaller")
+  callsReceived   Call[]           @relation("CallReceiver")
+  notifications   Notification[]
+  otpCodes        OtpCode[]
+  refreshTokens   RefreshToken[]
+  reports         Report[]         @relation("ReportingUser")
+  reportedAgainst Report[]         @relation("ReportedUser")
+
+  @@index([email])
+  @@index([phone])
+  @@index([referralCode])
+}
+
+// Ledger of every wallet credit/debit, so balances are always auditable
+// (e.g. "Referral bonus: Maya R. signed up using your code").
+model WalletTransaction {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  amount      Int      // positive = credit, negative = debit
+  type        String   // "REFERRAL_BONUS" | "ADMIN_ADJUSTMENT" | etc.
+  description String?
+  relatedUserId String? // e.g. the referred user, for REFERRAL_BONUS entries
+  createdAt   DateTime @default(now())
+
+  @@index([userId])
+}
+
+model OtpCode {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  codeHash  String   // never store raw OTP
+  purpose   String   // "EMAIL_VERIFY" | "PASSWORD_RESET"
+  expiresAt DateTime
+  consumed  Boolean  @default(false)
+  attempts  Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([userId, purpose])
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String   @unique
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+  deviceInfo String?
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------
+// VENDOR / KYC VERIFICATION
+// ---------------------------------------------------------------
+
+model VendorProfile {
+  id              String       @id @default(uuid())
+  userId          String       @unique
+  user            User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessName    String
+  bio             String?
+  shopAddress     String?
+  shopEmail       String?
+  status          VendorStatus @default(NONE)
+  cacDocumentUrl  String?
+  cacRegisteredName String?
+  ninDocumentUrl  String?
+  ninRegisteredName String?
+  namesVerifiedAutomatically Boolean @default(false)
+  reviewedBy      String?      // admin user id
+  reviewedAt      DateTime?
+  rejectionReason String?
+  submittedAt     DateTime?
+  createdAt       DateTime     @default(now())
+  updatedAt       DateTime     @updatedAt
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------
+// BRANDS / CATEGORIES (folder + sub-folder structure)
+// ---------------------------------------------------------------
+
+model Brand {
+  id         String     @id @default(uuid())
+  name       String     @unique   // "Apple", "Samsung", etc.
+  colorHex   String?
+  sortOrder  Int        @default(0)
+  categories Category[]
+  listings   Listing[]
+}
+
+model Category {
+  id        String   @id @default(uuid())
+  name      String   // "iPhone", "MacBook", "Phone", "Buds"...
+  icon      String?  // icon key used by frontend
+  brandId   String
+  brand     Brand    @relation(fields: [brandId], references: [id], onDelete: Cascade)
+  listings  Listing[]
+
+  @@unique([brandId, name])
+}
+
+// ---------------------------------------------------------------
+// LISTINGS / PRODUCTS
+// ---------------------------------------------------------------
+
+model Listing {
+  id            String            @id @default(uuid())
+  sellerId      String
+  seller        User              @relation(fields: [sellerId], references: [id], onDelete: Cascade)
+  brandId       String
+  brand         Brand             @relation(fields: [brandId], references: [id])
+  categoryId    String
+  category      Category          @relation(fields: [categoryId], references: [id])
+
+  name          String            // listing title
+  model         String
+  storage       String?
+  color         String?
+  condition     ProductCondition
+  estimatedValue Int              // whole Naira (NOT kobo) — e.g. 620000 means ₦620,000. Matches frontend formatNaira().
+  wantsInReturn String?
+  batteryHealth Int?              // 0-100
+  distanceLabel String?           // free-text e.g. "1.2 mi" — could be derived from geo later
+
+  repairDetails String[]          @default([]) // checklist tags e.g. ["Screen","Battery"]
+  repairNotes   String?
+
+  // ---- Guarantee policy ----
+  // Minimum days enforced per condition at creation time (see GUARANTEE_MINIMUMS
+  // in listingValidators.js): BRAND_NEW/UK_USED >= 7, NIGERIAN_USED/REPAIRED >= 2,
+  // REFURBISHED is always 0 (no guarantee — non-original device/parts).
+  // Sellers may offer MORE than the minimum but never less.
+  guaranteeDays Int               @default(0)
+  guaranteeNote String?           // e.g. "Void if there is any physical damage" — always shown to buyers
+
+  // Optional link to the specific physical device being sold, if the seller
+  // has it registered (My Devices / IMEI checker). When present, ownership of
+  // this Device record automatically transfers to the buyer the moment the
+  // order's escrow is released (see releaseWithHandoffCode in
+  // orderController.js) — proven physical handoff, not just a checkout click.
+  deviceId      String?           @unique
+  device        Device?           @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+
+  swapsCount    Int               @default(0)
+  likesCount    Int               @default(0)
+  published     Boolean           @default(true)
+
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  photos        ListingPhoto[]
+  likes         Like[]
+  swapRequests  SwapRequest[]
+  orders        Order[]
+  sharedInMessages Message[]      @relation("SharedListing")
+
+  @@index([sellerId])
+  @@index([brandId, categoryId])
+  @@index([condition])
+  @@index([published])
+}
+
+model ListingPhoto {
+  id        String   @id @default(uuid())
+  listingId String
+  listing   Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  url       String
+  isCover   Boolean  @default(false)
+  sortOrder Int      @default(0)
+
+  @@index([listingId])
+}
+
+model Like {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  listingId String
+  listing   Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, listingId]) // one like per user per listing - this also indexes userId as the leading column
+  @@index([listingId]) // explicit index for listingId-only lookups, which the composite unique above doesn't efficiently serve
+}
+
+// ---------------------------------------------------------------
+// SWAP / FAIRNESS REQUESTS
+// ---------------------------------------------------------------
+
+model SwapRequest {
+  id            String   @id @default(uuid())
+  listingId     String
+  listing       Listing  @relation(fields: [listingId], references: [id], onDelete: Cascade)
+  buyerId       String
+  buyer         User     @relation("SwapBuyer", fields: [buyerId], references: [id], onDelete: Cascade)
+  sellerId      String
+  seller        User     @relation("SwapSeller", fields: [sellerId], references: [id], onDelete: Cascade)
+  buyerItemValue Int?    // value of what buyer is offering, for fairness calc snapshot
+  fairnessDiff  Int?
+  status        String   @default("PROPOSED") // PROPOSED | ACCEPTED | DECLINED | COMPLETED | CANCELLED
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([listingId])
+  @@index([buyerId])
+  @@index([sellerId])
+}
+
+// ---------------------------------------------------------------
+// WALLET / ESCROW / IN-APP PAYMENTS
+//
+// Design: every transaction is forced through the app. A buyer deposits real
+// money via a payment provider (Paystack/Flutterwave — see PaymentProvider
+// enum) into their wallet, then pays a seller for a specific Order. That
+// payment is held in ESCROW (not released to the seller) until the buyer
+// confirms receipt of the device, at which point it's released to the
+// seller's spendable wallet balance. The seller then withdraws to their own
+// bank account via a Payout, processed through the same payment provider.
+//
+// This schema is provider-agnostic by design — PaymentDeposit/Payout store a
+// providerReference so swapping from manual/test mode to a real Paystack/
+// Flutterwave integration later only touches the payment service layer, not
+// this data model.
+// ---------------------------------------------------------------
+
+enum OrderStatus {
+  AWAITING_PAYMENT   // order created, buyer hasn't paid yet
+  PAID_IN_ESCROW      // buyer's payment is held, not yet released to seller
+  RELEASED            // buyer confirmed receipt — funds released to seller's wallet
+  DISPUTED             // buyer raised an issue before confirming — frozen, needs admin review
+  REFUNDED             // admin resolved a dispute in the buyer's favor — money returned to buyer's wallet
+  CANCELLED            // order cancelled before payment, or by mutual agreement before release
+}
+
+enum PaymentProvider {
+  MANUAL      // admin-credited for testing / offline reconciliation — no real money movement
+  PAYSTACK
+  FLUTTERWAVE
+}
+
+enum DepositStatus {
+  PENDING
+  SUCCESSFUL
+  FAILED
+}
+
+enum PayoutStatus {
+  PENDING
+  PROCESSING
+  PAID
+  FAILED
+}
+
+// A single purchase of a specific listing, paid for entirely in-app. This is
+// the unit the escrow hold/release state machine operates on.
+model Order {
+  id              String      @id @default(uuid())
+  listingId       String
+  listing         Listing     @relation(fields: [listingId], references: [id])
+  buyerId         String
+  buyer           User        @relation("OrderBuyer", fields: [buyerId], references: [id])
+  sellerId        String
+  seller          User        @relation("OrderSeller", fields: [sellerId], references: [id])
+
+  amount          Int         // whole Naira, snapshot of the listing price at time of order
+  status          OrderStatus @default(AWAITING_PAYMENT)
+
+  // ---- Handoff verification ----
+  // Generated the moment the buyer pays. Shown ONLY to the buyer in-app. At
+  // physical handoff, the buyer shows/tells this code to the seller, who
+  // enters it to release escrowed funds — proving the buyer actually received
+  // the device and approved the handoff, rather than just a tap-to-confirm
+  // that either party could trigger by mistake or under pressure.
+  handoffCodeHash String?     // hashed, never stored or returned in plaintext after generation
+  handoffAttempts Int         @default(0) // failed seller-entry attempts, rate-limited
+
+  paidAt          DateTime?
+  releasedAt      DateTime?
+  disputedAt      DateTime?
+  disputeReason   String?
+  refundedAt      DateTime?
+  cancelledAt     DateTime?
+
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  @@index([buyerId])
+  @@index([sellerId])
+  @@index([listingId])
+  @@index([status])
+}
+
+// A real-money deposit into a user's wallet. In MANUAL mode (no provider
+// configured yet), admin creates these directly to credit a user after
+// confirming a bank transfer themselves. Once a real provider is wired in,
+// these are created automatically from the provider's webhook.
+model PaymentDeposit {
+  id                 String          @id @default(uuid())
+  userId             String
+  user               User            @relation(fields: [userId], references: [id])
+  amount             Int             // whole Naira credited to the wallet
+  provider           PaymentProvider @default(MANUAL)
+  providerReference  String?         @unique // the provider's transaction ID, for webhook idempotency
+  status             DepositStatus   @default(PENDING)
+  note               String?         // e.g. "Manual credit by admin after bank transfer confirmation"
+  creditedByAdminId  String?         // set when an admin manually credited this (MANUAL provider)
+  createdAt          DateTime        @default(now())
+  confirmedAt        DateTime?
+
+  @@index([userId])
+  @@index([status])
+}
+
+// Registered bank accounts for a user (max 2). Payouts can only be sent to
+// one of these accounts — prevents sending money to arbitrary/unknown accounts.
+model BankAccount {
+  id            String   @id @default(uuid())
+  userId        String
+  user          User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  bankName      String
+  accountNumber String
+  accountName   String
+  isDefault     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  @@index([userId])
+}
+
+// A withdrawal of a seller's spendable wallet balance out to their real bank
+// account. In MANUAL mode, admin marks these PAID after sending the transfer
+// themselves; once a real provider is wired in, this calls their transfer API.
+model Payout {
+  id                String          @id @default(uuid())
+  userId            String
+  user              User            @relation(fields: [userId], references: [id])
+  amount            Int             // whole Naira debited from the wallet
+  provider          PaymentProvider @default(MANUAL)
+  providerReference String?         @unique
+  status            PayoutStatus    @default(PENDING)
+  bankName          String?
+  accountNumber     String?
+  accountName       String?
+  failureReason     String?
+  processedByAdminId String?
+  createdAt         DateTime        @default(now())
+  processedAt       DateTime?
+
+  @@index([userId])
+  @@index([status])
+}
+
+// ---------------------------------------------------------------
+// COMMUNITIES (state-based groups, all 36 states + FCT)
+// ---------------------------------------------------------------
+
+model Community {
+  id          String            @id @default(uuid())
+  state       String            @unique  // "Lagos Swappers" etc.
+  region      String            // "Lagos State"
+  description String?
+  createdAt   DateTime          @default(now())
+
+  members     CommunityMember[]
+  messages    Message[]         @relation("CommunityMessages")
+
+  @@index([state])
+}
+
+model CommunityMember {
+  id          String    @id @default(uuid())
+  communityId String
+  community   Community @relation(fields: [communityId], references: [id], onDelete: Cascade)
+  userId      String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  joinedAt    DateTime  @default(now())
+  role        String    @default("MEMBER") // MEMBER | ADMIN
+
+  @@unique([communityId, userId])
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------
+// MESSAGING — unified inbox: group messages + private threads
+// ---------------------------------------------------------------
+
+// A Thread is a 1:1 conversation. It can originate from:
+//  - a private reply to someone's group message (sourceType = GROUP_REPLY)
+//  - opening "Propose swap" on a listing (sourceType = LISTING_CHAT)
+//  - the permanent Xpatswap Admin support thread (sourceType = SUPPORT, userB = null)
+model Thread {
+  id            String           @id @default(uuid())
+  userAId       String
+  userA         User             @relation("ThreadUserA", fields: [userAId], references: [id], onDelete: Cascade)
+  userBId       String?          // nullable for SUPPORT threads (system/admin on other side)
+  userB         User?            @relation("ThreadUserB", fields: [userBId], references: [id], onDelete: Cascade)
+  sourceType    ThreadSourceType
+  sourceLabel   String?          // e.g. "RE: iPhone 14 Pro" or community name
+  relatedListingId String?
+  relatedCommunityId String?
+  lastActivityAt DateTime        @default(now())
+  createdAt     DateTime         @default(now())
+
+  messages      Message[]        @relation("ThreadMessages")
+
+  @@unique([userAId, userBId, sourceType, relatedListingId])
+  @@index([userAId])
+  @@index([userBId])
+  // Note: Postgres treats NULL as distinct in unique constraints, so the
+  // @@unique above does not by itself prevent duplicate SUPPORT threads
+  // (where userBId and relatedListingId are both null). getOrCreateSupportThread()
+  // in threadController.js guards against this in application code via find-then-create;
+  // for stricter DB-level guarantees, add a partial unique index in a raw migration:
+  //   CREATE UNIQUE INDEX thread_support_unique ON "Thread" ("userAId")
+  //   WHERE "sourceType" = 'SUPPORT';
+}
+
+model Message {
+  id              String       @id @default(uuid())
+  senderId        String?      // null for SYSTEM messages or admin auto-replies
+  sender          User?        @relation("MessageSender", fields: [senderId], references: [id], onDelete: SetNull)
+
+  // exactly one of threadId / communityId should be set
+  threadId        String?
+  thread          Thread?      @relation("ThreadMessages", fields: [threadId], references: [id], onDelete: Cascade)
+  communityId     String?
+  community       Community?   @relation("CommunityMessages", fields: [communityId], references: [id], onDelete: Cascade)
+
+  type            MessageType  @default(TEXT)
+  text            String?
+  mediaUrl        String?      // image or voice note URL
+  voiceDurationSec Int?
+  sharedListingId String?
+  sharedListing   Listing?     @relation("SharedListing", fields: [sharedListingId], references: [id], onDelete: SetNull)
+  latitude        Float?
+  longitude       Float?
+  locationAccuracyM Int?
+
+  // Stolen-device broadcast: pinned to the top of every community this message
+  // was posted into, linking back to the reported device and its owner.
+  pinned          Boolean      @default(false)
+  alertDeviceId   String?
+  alertDevice     Device?      @relation(fields: [alertDeviceId], references: [id], onDelete: SetNull)
+
+  // context: when replying privately to a group message, keep a snapshot of what was tapped
+  quotedSenderName String?
+  quotedText       String?
+  quotedCommunityId String?
+
+  createdAt       DateTime     @default(now())
+  readAt          DateTime?
+
+  @@index([threadId])
+  @@index([communityId])
+  @@index([pinned])
+  @@index([senderId])
+}
+
+// ---------------------------------------------------------------
+// CALLS (voice/video call log — actual media routed via WebRTC/SFU,
+// this just tracks call metadata for the in-app call log)
+// ---------------------------------------------------------------
+
+model Call {
+  id           String     @id @default(uuid())
+  callerId     String
+  caller       User       @relation("CallCaller", fields: [callerId], references: [id], onDelete: Cascade)
+  receiverId   String
+  receiver     User       @relation("CallReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+  type         CallType
+  status       CallStatus @default(RINGING)
+  startedAt    DateTime   @default(now())
+  connectedAt  DateTime?
+  endedAt      DateTime?
+  durationSec  Int?
+  threadId     String?    // ties the call-log entry back into the relevant chat thread
+
+  @@index([callerId])
+  @@index([receiverId])
+}
+
+// ---------------------------------------------------------------
+// NOTIFICATIONS
+// ---------------------------------------------------------------
+
+model Notification {
+  id        String           @id @default(uuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type      NotificationType
+  title     String
+  body      String?
+  data      Json?            // arbitrary payload (threadId, listingId, etc.)
+  read      Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  @@index([userId, read])
+}
+
+// ---------------------------------------------------------------
+// MODERATION
+// ---------------------------------------------------------------
+
+model Report {
+  id              String   @id @default(uuid())
+  reportingUserId String
+  reportingUser   User     @relation("ReportingUser", fields: [reportingUserId], references: [id], onDelete: Cascade)
+  reportedUserId  String?
+  reportedUser    User?    @relation("ReportedUser", fields: [reportedUserId], references: [id], onDelete: Cascade)
+  reportedListingId String?
+  reason          String
+  details         String?
+  status          String   @default("OPEN") // OPEN | REVIEWED | DISMISSED | ACTIONED
+  createdAt       DateTime @default(now())
+
+  @@index([status])
+}
+
+// ---------------------------------------------------------------
+// IMEI / DEVICE REGISTRY + STOLEN DEVICE TRACKING
+// ---------------------------------------------------------------
+
+enum DeviceStatus {
+  ACTIVE
+  STOLEN
+  RECOVERED
+}
+
+// A phone registered to a user's account by IMEI. Used for the IMEI checker
+// (verify a phone isn't reported stolen before buying it) and the stolen-device
+// flow (owner reports it stolen; if the Xpatswap app is later opened on that
+// exact device — by anyone, logged into any account — it silently checks in
+// with its current location, visible to admin).
+model Device {
+  id          String        @id @default(uuid())
+  imei        String        @unique
+  ownerId     String
+  owner       User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  brand       String?
+  model       String?
+  status      DeviceStatus  @default(ACTIVE)
+  reportedStolenAt DateTime?
+  recoveredAt DateTime?
+  createdAt   DateTime      @default(now())
+
+  locationPings DeviceLocationPing[]
+  alertMessages Message[]
+  searchLogs    DeviceImeiSearchLog[]
+  listing       Listing?            // the active listing selling this device, if any
+  ownershipHistory DeviceOwnershipTransfer[]
+
+  @@index([ownerId])
+  @@index([status])
+}
+
+// A location check-in. Created either when the registered owner reports the
+// device stolen (no location yet, just the flag) or whenever the Xpatswap app
+// is opened on a device whose IMEI matches a STOLEN record (regardless of which
+// account is logged in at the time) and location permission is available.
+model DeviceLocationPing {
+  id        String   @id @default(uuid())
+  deviceId  String
+  device    Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  latitude  Float?
+  longitude Float?
+  accuracyM Int?
+  loggedInUserId String? // whoever was using the app at the time of this ping, if anyone
+  createdAt DateTime @default(now())
+
+  @@index([deviceId])
+}
+
+// Every lookup made through the IMEI Checker, kept for admin visibility —
+// particularly useful for flagging when someone searches an IMEI that comes
+// back STOLEN, which may mean they're being offered (or are about to buy) a
+// stolen device.
+model DeviceImeiSearchLog {
+  id          String   @id @default(uuid())
+  imei        String
+  deviceId    String?  // set if the IMEI matched a registered Device
+  device      Device?  @relation(fields: [deviceId], references: [id], onDelete: SetNull)
+  searchedById String? // the logged-in user who ran the search, if any
+  searchedBy  User?    @relation(fields: [searchedById], references: [id], onDelete: SetNull)
+  resultStatus String  // "UNKNOWN" | "ACTIVE" | "STOLEN" | "RECOVERED"
+  createdAt   DateTime @default(now())
+
+  @@index([imei])
+  @@index([resultStatus])
+}
+
+// Permanent audit trail of every IMEI ownership change. Created automatically
+// when an order's escrow is released for a listing linked to a registered
+// device — never edited or deleted, so a device's full chain of legitimate
+// owners is always reconstructable (useful for admin review and for buyers
+// checking an IMEI's history before purchase).
+model DeviceOwnershipTransfer {
+  id           String   @id @default(uuid())
+  deviceId     String
+  device       Device   @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  fromUserId   String?  // null if this was the device's first-ever registration
+  fromUser     User?    @relation("DeviceTransferFrom", fields: [fromUserId], references: [id], onDelete: SetNull)
+  toUserId     String
+  toUser       User     @relation("DeviceTransferTo", fields: [toUserId], references: [id], onDelete: Cascade)
+  orderId      String?  // the order that triggered this transfer, if automatic
+  reason       String   @default("ORDER_RELEASED") // "ORDER_RELEASED" | "ADMIN_REASSIGNED" | "INITIAL_REGISTRATION"
+  createdAt    DateTime @default(now())
+
+  @@index([deviceId])
+  @@index([toUserId])
+}
+
+// ---------------------------------------------------------------
+// WEB PUSH (background / locked-screen notifications)
+// ---------------------------------------------------------------
+
+// One row per browser/device the user has enabled push on (they may have
+// multiple — phone + desktop, etc.). Stores the standard Web Push subscription
+// object (endpoint + encryption keys) issued by the browser's push service.
+model PushSubscription {
+  id        String   @id @default(uuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  endpoint  String   @unique
+  p256dh    String
+  auth      String
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------
+// ADMINS (separate from regular users — internal review team)
+// ---------------------------------------------------------------
+
+model Admin {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  fullName     String
+  role         String   @default("REVIEWER") // REVIEWER | SUPER_ADMIN
+  createdAt    DateTime @default(now())
+}

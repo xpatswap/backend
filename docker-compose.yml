@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: xpatswap-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: xpatswap
+      POSTGRES_PASSWORD: xpatswap_dev_password
+      POSTGRES_DB: xpatswap
+    ports:
+      - '5432:5432'
+    volumes:
+      - xpatswap_pg_data:/var/lib/postgresql/data
+
+volumes:
+  xpatswap_pg_data:
